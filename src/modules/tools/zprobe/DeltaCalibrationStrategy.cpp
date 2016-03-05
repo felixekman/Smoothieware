@@ -12,11 +12,14 @@
 #include "Conveyor.h"
 #include "ZProbe.h"
 #include "BaseSolution.h"
+#include "StepperMotor.h"
 
 #include <tuple>
 #include <algorithm>
 
-#define radius_checksum       CHECKSUM("radius")
+#define radius_checksum         CHECKSUM("radius")
+#define initial_height_checksum CHECKSUM("initial_height")
+
 // deprecated
 #define probe_radius_checksum CHECKSUM("probe_radius")
 
@@ -29,6 +32,10 @@ bool DeltaCalibrationStrategy::handleConfig()
         r =  THEKERNEL->config->value(zprobe_checksum, probe_radius_checksum)->by_default(100.0F)->as_number();
     }
     this->probe_radius= r;
+
+    // the initial height above the bed we stop the intial move down after home to find the bed
+    // this should be a height that is enough that the probe will not hit the bed and is an offset from max_z (can be set to 0 if max_z takes into account the probe offset)
+    this->initial_height= THEKERNEL->config->value(leveling_strategy_checksum, delta_calibration_strategy_checksum, initial_height_checksum)->by_default(10)->as_number();
     return true;
 }
 
@@ -40,19 +47,29 @@ bool DeltaCalibrationStrategy::handleGcode(Gcode *gcode)
             // first wait for an empty queue i.e. no moves left
             THEKERNEL->conveyor->wait_for_empty_queue();
 
+            // turn off any compensation transform as it will be invalidated anyway by this
+            THEKERNEL->robot->compensationTransform= nullptr;
+
             if(!gcode->has_letter('R')) {
                 if(!calibrate_delta_endstops(gcode)) {
-                    gcode->stream->printf("Calibration failed to complete, probe not triggered\n");
+                    gcode->stream->printf("Calibration failed to complete\n");
                     return true;
                 }
             }
             if(!gcode->has_letter('E')) {
                 if(!calibrate_delta_radius(gcode)) {
-                    gcode->stream->printf("Calibration failed to complete, probe not triggered\n");
+                    gcode->stream->printf("Calibration failed to complete\n");
                     return true;
                 }
             }
             gcode->stream->printf("Calibration complete, save settings with M500\n");
+            return true;
+
+        }else if (gcode->g == 29) {
+            // probe the 7 points
+            if(!probe_delta_points(gcode)) {
+                gcode->stream->printf("Calibration failed to complete\n");
+            }
             return true;
         }
 
@@ -63,8 +80,6 @@ bool DeltaCalibrationStrategy::handleGcode(Gcode *gcode)
     return false;
 }
 
-
-
 // calculate the X and Y positions for the three towers given the radius from the center
 static std::tuple<float, float, float, float, float, float> getCoordinates(float radius)
 {
@@ -74,6 +89,86 @@ static std::tuple<float, float, float, float, float, float> getCoordinates(float
     float t2x = px, t2y = -py; // Y Tower
     float t3x = 0.0F, t3y = radius; // Z Tower
     return std::make_tuple(t1x, t1y, t2x, t2y, t3x, t3y);
+}
+
+
+// Probes the 7 points on a delta can be used for off board calibration
+bool DeltaCalibrationStrategy::probe_delta_points(Gcode *gcode)
+{
+    float bedht= findBed();
+    if(isnan(bedht)) return false;
+
+    gcode->stream->printf("initial Bed ht is %f mm\n", bedht);
+
+    // check probe ht
+    int s;
+    if(!zprobe->doProbeAt(s, 0, 0)) return false;
+    float dz = zprobe->getProbeHeight() - zprobe->zsteps_to_mm(s);
+    gcode->stream->printf("center probe: %1.4f\n", dz);
+
+    // get probe points
+    float t1x, t1y, t2x, t2y, t3x, t3y;
+    std::tie(t1x, t1y, t2x, t2y, t3x, t3y) = getCoordinates(this->probe_radius);
+
+    // gather probe points
+    float pp[][2] {{t1x, t1y}, {t2x, t2y}, {t3x, t3y}, {0, 0}, {-t1x, -t1y}, {-t2x, -t2y}, {-t3x, -t3y}};
+
+    float max_delta= 0;
+    float last_z= NAN;
+    float start_z;
+    std::tie(std::ignore, std::ignore, start_z)= THEKERNEL->robot->get_axis_position();
+
+    for(auto& i : pp) {
+        int s;
+        if(!zprobe->doProbeAt(s, i[0], i[1])) return false;
+        float z = zprobe->zsteps_to_mm(s);
+        if(gcode->subcode == 0) {
+            gcode->stream->printf("X:%1.4f Y:%1.4f Z:%1.4f (%d) A:%1.4f B:%1.4f C:%1.4f\n",
+                i[0], i[1], z, s,
+                THEKERNEL->robot->actuators[0]->get_current_position()+z,
+                THEKERNEL->robot->actuators[1]->get_current_position()+z,
+                THEKERNEL->robot->actuators[2]->get_current_position()+z);
+
+        }else if(gcode->subcode == 1) {
+            // format that can be pasted here http://escher3d.com/pages/wizards/wizarddelta.php
+            gcode->stream->printf("X%1.4f Y%1.4f Z%1.4f\n", i[0], i[1], start_z - z);
+        }
+
+        if(isnan(last_z)) {
+            last_z= z;
+        }else{
+            max_delta= std::max(max_delta, fabsf(z-last_z));
+        }
+    }
+
+    gcode->stream->printf("max delta: %f\n", max_delta);
+
+    return true;
+}
+
+float DeltaCalibrationStrategy::findBed()
+{
+    // home
+    zprobe->home();
+
+    // move to an initial position fast so as to not take all day, we move down max_z - initial_height, which is set in config, default 10mm
+    float deltaz= zprobe->getMaxZ() - initial_height;
+    zprobe->coordinated_move(NAN, NAN, -deltaz, zprobe->getFastFeedrate(), true);
+
+    // find bed, run at slow rate so as to not hit bed hard
+    int s;
+    if(!zprobe->run_probe(s, false)) return NAN;
+    zprobe->return_probe(s);
+
+    // leave the probe zprobe->getProbeHeight() above bed
+    float dz= zprobe->getProbeHeight() - zprobe->zsteps_to_mm(s);
+    if(dz >= 0) {
+        // probe was not started above bed
+        return NAN;
+    }
+    zprobe->coordinated_move(NAN, NAN, dz, zprobe->getFastFeedrate(), true); // relative move
+
+    return zprobe->zsteps_to_mm(s) + deltaz - zprobe->getProbeHeight(); // distance to move from home to 5mm above bed
 }
 
 /* Run a calibration routine for a delta
@@ -117,19 +212,21 @@ bool DeltaCalibrationStrategy::calibrate_delta_endstops(Gcode *gcode)
         }
     }
 
-    // home
-    zprobe->home();
+    // find the bed, as we potentially have a temporary z probe we don't know how low under the nozzle it is
+    // so we need to find the initial place that the probe triggers when it hits the bed
+    float bedht= findBed();
+    if(isnan(bedht)) return false;
+    gcode->stream->printf("initial Bed ht is %f mm\n", bedht);
 
-    // find bed, run at fast rate
+    // check probe ht
     int s;
-    if(!zprobe->run_probe(s, true)) return false;
-
-    float bedht = zprobe->zsteps_to_mm(s) - zprobe->getProbeHeight(); // distance to move from home to 5mm above bed
-    gcode->stream->printf("Bed ht is %f mm\n", bedht);
-
-    // move to start position
-    zprobe->home();
-    zprobe->coordinated_move(NAN, NAN, -bedht, zprobe->getFastFeedrate(), true); // do a relative move from home to the point above the bed
+    if(!zprobe->doProbeAt(s, 0, 0)) return false;
+    float dz = zprobe->getProbeHeight() - zprobe->zsteps_to_mm(s);
+    gcode->stream->printf("center probe: %1.4f\n", dz);
+    if(fabsf(dz) > target) {
+         gcode->stream->printf("Probe was not repeatable to %f mm, (%f)\n", target, dz);
+         return false;
+    }
 
     // get initial probes
     // probe the base of the X tower
@@ -222,15 +319,21 @@ bool DeltaCalibrationStrategy::calibrate_delta_radius(Gcode *gcode)
     float t1x, t1y, t2x, t2y, t3x, t3y;
     std::tie(t1x, t1y, t2x, t2y, t3x, t3y) = getCoordinates(this->probe_radius);
 
-    zprobe->home();
-    // find bed, then move to a point 5mm above it
-    int s;
-    if(!zprobe->run_probe(s, true)) return false;
-    float bedht = zprobe->zsteps_to_mm(s) - zprobe->getProbeHeight(); // distance to move from home to 5mm above bed
-    gcode->stream->printf("Bed ht is %f mm\n", bedht);
+    // find the bed, as we potentially have a temporary z probe we don't know how low under the nozzle it is
+    // so we need to find thr initial place that the probe triggers when it hits the bed
+    float bedht= findBed();
+    if(isnan(bedht)) return false;
+    gcode->stream->printf("initial Bed ht is %f mm\n", bedht);
 
-    zprobe->home();
-    zprobe->coordinated_move(NAN, NAN, -bedht, zprobe->getFastFeedrate(), true); // do a relative move from home to the point above the bed
+    // check probe ht
+    int s;
+    if(!zprobe->doProbeAt(s, 0, 0)) return false;
+    float dz = zprobe->getProbeHeight() - zprobe->zsteps_to_mm(s);
+    gcode->stream->printf("center probe: %1.4f\n", dz);
+    if(fabsf(dz) > target) {
+         gcode->stream->printf("Probe was not repeatable to %f mm, (%f)\n", target, dz);
+         return false;
+    }
 
     // probe center to get reference point at this Z height
     int dc;
@@ -250,6 +353,7 @@ bool DeltaCalibrationStrategy::calibrate_delta_radius(Gcode *gcode)
     }
     options.clear();
 
+    bool good= false;
     float drinc = 2.5F; // approx
     for (int i = 1; i <= 10; ++i) {
         // probe t1, t2, t3 and get average, but use coordinated moves, probing center won't change
@@ -266,7 +370,10 @@ bool DeltaCalibrationStrategy::calibrate_delta_radius(Gcode *gcode)
         float d = cmm - m;
         gcode->stream->printf("C-%d Z-ave:%1.4f delta: %1.3f\n", i, m, d);
 
-        if(abs(d) <= target) break; // resolution of success
+        if(fabsf(d) <= target){
+            good= true;
+            break; // resolution of success
+        }
 
         // increase delta radius to adjust for low center
         // decrease delta radius to adjust for high center
@@ -283,6 +390,11 @@ bool DeltaCalibrationStrategy::calibrate_delta_radius(Gcode *gcode)
         // flush the output
         THEKERNEL->call_event(ON_IDLE);
     }
+
+    if(!good) {
+        gcode->stream->printf("WARNING: delta radius did not resolve to within required parameters: %f\n", target);
+    }
+
     return true;
 }
 

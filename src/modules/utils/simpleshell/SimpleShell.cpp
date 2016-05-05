@@ -175,21 +175,8 @@ void SimpleShell::on_gcode_received(void *argument)
             gcode->stream->printf("End file list\r\n");
 
         } else if (gcode->m == 30) { // remove file
-            rm_command("/sd/" + args, gcode->stream);
-
-        } else if(gcode->m == 501) { // load config override
-            if(args.empty()) {
-                load_command("/sd/config-override", gcode->stream);
-            } else {
-                load_command("/sd/config-override." + args, gcode->stream);
-            }
-
-        } else if(gcode->m == 504) { // save to specific config override file
-            if(args.empty()) {
-                save_command("/sd/config-override", gcode->stream);
-            } else {
-                save_command("/sd/config-override." + args, gcode->stream);
-            }
+            if(!args.empty() && !THEKERNEL->is_grbl_mode())
+                rm_command("/sd/" + args, gcode->stream);
         }
     }
 }
@@ -223,15 +210,17 @@ void SimpleShell::on_console_line_received( void *argument )
             case 'G':
                 // issue get state
                 get_command("state", new_message.stream);
+                new_message.stream->printf("ok\n");
                 break;
 
             case 'X':
                 THEKERNEL->call_event(ON_HALT, (void *)1); // clears on_halt
-                new_message.stream->printf("[Caution: Unlocked]\n");
+                new_message.stream->printf("[Caution: Unlocked]\nok\n");
                 break;
 
             case '#':
                 grblDP_command("", new_message.stream);
+                new_message.stream->printf("ok\n");
                 break;
 
             case 'H':
@@ -266,6 +255,7 @@ void SimpleShell::on_console_line_received( void *argument )
             THEKERNEL->configurator->config_load_command(  possible_command, new_message.stream );
 
         } else if (cmd == "play" || cmd == "progress" || cmd == "abort" || cmd == "suspend" || cmd == "resume") {
+            // these are handled by Player module
 
         } else if (cmd == "ok") {
             // probably an echo so reply ok
@@ -513,8 +503,11 @@ void SimpleShell::load_command( string parameters, StreamOutput *stream )
         while(fgets(buf, sizeof buf, fp) != NULL) {
             stream->printf("  %s", buf);
             if(buf[0] == ';') continue; // skip the comments
-            struct SerialMessage message = {&(StreamOutput::NullStream), buf};
-            THEKERNEL->call_event(ON_CONSOLE_LINE_RECEIVED, &message);
+            // NOTE only Gcodes and Mcodes can be in the config-override
+            Gcode *gcode = new Gcode(buf, &StreamOutput::NullStream);
+            THEKERNEL->call_event(ON_GCODE_RECEIVED, gcode);
+            delete gcode;
+            THEKERNEL->call_event(ON_IDLE);
         }
         stream->printf("config override file executed\n");
         fclose(fp);
@@ -810,6 +803,10 @@ void SimpleShell::get_command( string parameters, StreamOutput *stream)
             get_active_tool(),
             THEKERNEL->robot->get_feed_rate());
 
+    } else if (what == "status") {
+        // also ? on serial and usb
+        stream->printf("%s\n", THEKERNEL->get_query_string().c_str());
+
     } else {
         stream->printf("error:unknown option %s\n", what.c_str());
     }
@@ -934,7 +931,7 @@ void SimpleShell::help_command( string parameters, StreamOutput *stream )
     stream->printf("break - break into debugger\r\n");
     stream->printf("config-get [<configuration_source>] <configuration_setting>\r\n");
     stream->printf("config-set [<configuration_source>] <configuration_setting> <value>\r\n");
-    stream->printf("get [pos|wcs|state|fk|ik]\r\n");
+    stream->printf("get [pos|wcs|state|status|fk|ik]\r\n");
     stream->printf("get temp [bed|hotend]\r\n");
     stream->printf("set_temp bed|hotend 185\r\n");
     stream->printf("net\r\n");

@@ -5,22 +5,25 @@
       You should have received a copy of the GNU General Public License along with Smoothie. If not, see <http://www.gnu.org/licenses/>.
 */
 
-#pragma once
+#ifndef HUANYANG_SPINDLE_CONTROL_MODULE_H
+#define HUANYANG_SPINDLE_CONTROL_MODULE_H
 
-#include "PanelScreen.h"
+#include "ModbusSpindleControl.h"
+#include <stdint.h>
 
-class LaserScreen : public PanelScreen
-{
-public:
-    LaserScreen();
-    void on_refresh();
-    void on_enter();
-    void on_exit();
-    void display_menu_line(uint16_t line);
-    void clicked_menu_entry(uint16_t line);
-    int idle_timeout_secs() { return 60; }
-
-private:
-    void testFireScreen();
-    void setPowerScreen(int);
+// This module implements Modbus control for spindle control over Modbus.
+class HuanyangSpindleControl: public ModbusSpindleControl {
+    public:
+        HuanyangSpindleControl() {};
+        virtual ~HuanyangSpindleControl() {};
+        
+    private:
+        
+        void turn_on(void);
+        void turn_off(void);
+        void set_speed(int);
+        void report_speed(void);
 };
+
+#endif
+

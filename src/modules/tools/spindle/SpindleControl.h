@@ -5,22 +5,31 @@
       You should have received a copy of the GNU General Public License along with Smoothie. If not, see <http://www.gnu.org/licenses/>.
 */
 
-#pragma once
+#ifndef SPINDLE_CONTROL_MODULE_H
+#define SPINDLE_CONTROL_MODULE_H
 
-#include "PanelScreen.h"
+#include "libs/Module.h"
 
-class LaserScreen : public PanelScreen
-{
-public:
-    LaserScreen();
-    void on_refresh();
-    void on_enter();
-    void on_exit();
-    void display_menu_line(uint16_t line);
-    void clicked_menu_entry(uint16_t line);
-    int idle_timeout_secs() { return 60; }
+class SpindleControl: public Module {
+    public:
+        SpindleControl() {};
+        virtual ~SpindleControl() {};
+        virtual void on_module_loaded() {};
 
-private:
-    void testFireScreen();
-    void setPowerScreen(int);
+    protected:
+        bool spindle_on;
+
+    private:
+        void on_gcode_received(void *argument);
+        
+        virtual void turn_on(void) {};
+        virtual void turn_off(void) {};
+        virtual void set_speed(int) {};
+        virtual void report_speed(void) {};
+        virtual void set_p_term(float) {};
+        virtual void set_i_term(float) {};
+        virtual void set_d_term(float) {};
+        virtual void get_pid_settings(void) {};
 };
+
+#endif
